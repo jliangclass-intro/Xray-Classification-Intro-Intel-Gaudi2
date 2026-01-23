@@ -1,0 +1,19 @@
+batch_size: 128
+num_workers: 4
+epochs: 50
+lr: 1e-4
+weight_decay: 1e-4
+optimizer: adamw
+momentum: 0.9
+
+eval_every: 1
+seed: 42
+output_dir: artifacts
+save_predictions: true
+save_best_model: true
+
+# what to monitor for early stopping
+monitor: mean_auroc
+monitor_mode: max
+patience: 10
+

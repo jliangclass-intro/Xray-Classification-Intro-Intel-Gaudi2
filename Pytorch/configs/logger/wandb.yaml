@@ -1,0 +1,4 @@
+# WandB Logger Configuration (not yet implemented)
+type: wandb
+project: null  # WandB project name
+entity: null   # WandB entity/team name

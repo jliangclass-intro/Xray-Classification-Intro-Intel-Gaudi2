@@ -1,0 +1,18 @@
+defaults:
+  - dataset: chestxray14
+  - model: resnet50
+  - train: default
+  - logger: aim
+  - override hydra/hydra_logging: none
+  - override hydra/job_logging: none
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/${dataset.name}
+  job:
+    chdir: true
+  output_subdir: ${run_name}/.hydra
+
+# run_name constructed from config values: {dataset_name}_{backbone}_{optimizer}_{lr}_{date}_{time}
+run_name: ${dataset.name}_${model.backbone}_${train.optimizer}_${format_lr:${train.lr}}_${now:%Y%m%d}_${now:%H%M%S}

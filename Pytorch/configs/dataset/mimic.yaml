@@ -1,0 +1,64 @@
+# ASU Research Cluster
+# MIMIC-CXR Dataset Configuration
+
+name: MIMIC
+
+# Define dataset root path
+dataset_root: /scratch/sejong/class-dataset/cxr-256
+
+# full dataset_size: 500G
+train_image_root: "${dataset.dataset_root}/MIMIC_jpeg/physionet.org/files/mimic-cxr-jpg/2.0.0"
+val_image_root: "${dataset.dataset_root}/MIMIC_jpeg/physionet.org/files/mimic-cxr-jpg/2.0.0"
+test_image_root: "${dataset.dataset_root}/MIMIC_jpeg/physionet.org/files/mimic-cxr-jpg/2.0.0"
+
+train_ann: data/mimic_cxr/train.csv
+val_ann: data/mimic_cxr/val.csv
+test_ann: data/mimic_cxr/test.csv
+image_path_key: image_path
+
+labels:
+  - Atelectasis
+  - Cardiomegaly
+  - Consolidation
+  - Edema
+  - Enlarged Cardiomediastinum
+  - Fracture
+  - Lung Lesion
+  - Lung Opacity
+  - No Finding
+  - Pleural Effusion
+  - Pleural Other
+  - Pneumonia
+  - Pneumothorax
+  - Support Devices
+num_classes: 14
+
+test_labels:
+  top5:
+    - Atelectasis
+    - Cardiomegaly
+    - Consolidation
+    - Edema
+    - Pleural Effusion
+  top12:
+    - Atelectasis
+    - Cardiomegaly
+    - Consolidation
+    - Edema
+    - Enlarged Cardiomediastinum
+    - Fracture
+    - Lung Lesion
+    - Lung Opacity
+    - Pleural Effusion
+    - Pleural Other
+    - Pneumonia
+    - Pneumothorax
+
+test_diseases_name:
+  - Atelectasis
+  - Cardiomegaly
+  - Consolidation
+  - Edema
+  - Pleural Effusion
+
+task_type: multi-label classification

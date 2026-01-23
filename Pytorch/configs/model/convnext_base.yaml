@@ -1,0 +1,4 @@
+backbone: convnext_base
+pretrained: true
+image_size: 224
+normalize: imagenet

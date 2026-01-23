@@ -1,0 +1,3 @@
+# AIM Logger Configuration
+type: aim
+repo: null  # Will be set via environment variable or default to .aim

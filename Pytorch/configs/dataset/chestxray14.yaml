@@ -1,0 +1,36 @@
+# ASU Research Cluster
+# NIH Chest XRAY 14 Dataset Configuration
+
+name: ChestXray14
+
+# Define dataset root path (can be overridden by command line)
+dataset_root: /scratch/sejong/class-dataset/cxr-256
+
+train_ann: data/xray14/train.csv
+val_ann: data/xray14/val.csv
+test_ann: data/xray14/test.csv
+
+# Supports list of paths for fallback
+train_image_root: "${dataset.dataset_root}/nih_xray14/images/images/"
+val_image_root: "${dataset.dataset_root}/nih_xray14/images/images/"
+test_image_root: "${dataset.dataset_root}/nih_xray14/images/images/"
+
+image_path_key: Path
+image_path_append: ""
+
+labels:
+  - Atelectasis
+  - Cardiomegaly
+  - Effusion
+  - Infiltration
+  - Mass
+  - Nodule
+  - Pneumonia
+  - Pneumothorax
+  - Consolidation
+  - Edema
+  - Emphysema
+  - Fibrosis
+  - Pleural_Thickening
+  - Hernia
+num_classes: 14
