@@ -4,7 +4,14 @@ A **simple and clean** multi-label chest X-ray classification framework using **
 
 ## Overview
 
-This project provides a complete training pipeline for multi-label chest X-ray classification tasks. It supports multiple datasets (ChestX-ray14, CheXpert, MIMIC-CXR), various model architectures (ResNet, ConvNeXt, Swin Transformer), and includes comprehensive evaluation metrics with per-label AUROC reporting.
+This project provides a complete training pipeline for multi-label chest X-ray classification tasks. It is **primarily geared toward Intel Gaudi 2 (Habana HPU)** accelerators while **also fully supporting NVIDIA CUDA GPUs** (A100, V100, etc.) and CPU fallback. It supports multiple datasets (ChestX-ray14, CheXpert, MIMIC-CXR), various model architectures (ResNet, ConvNeXt, Swin Transformer), and includes comprehensive evaluation metrics with per-label AUROC reporting.
+
+### Hardware Compatibility: Intel Gaudi 2 (HPU) & NVIDIA CUDA
+
+This codebase works on **both Intel Gaudi 2 and NVIDIA CUDA GPUs**:
+- **Primary Target — Intel Gaudi 2 (`hpu`)**: Configured for `gaudi*` nodes on the ASU SOL cluster (`gaudi-pytorch-vllm` environment) using `bfloat16` mixed precision. See [`INTEL_GAUDI2_GUIDE.md`](./INTEL_GAUDI2_GUIDE.md) for HPU-specific best practices.
+- **Full Support — NVIDIA GPUs (`cuda`)**: Works out-of-the-box on NVIDIA GPUs (e.g., A100 on SOL with `bfloat16`, V100 on Phoenix with `float16` AMP + `GradScaler`, or local CUDA machines).
+- **Automatic Hardware Detection**: Both `setup_env.sh` and `get_best_accelerator()` in `src/utils.py` automatically detect whether you are on a Gaudi 2 node (`hpu`), an NVIDIA GPU node (`cuda`), or `cpu`, and select the appropriate environment, device, and mixed-precision mode.
 
 ### Key Features
 
