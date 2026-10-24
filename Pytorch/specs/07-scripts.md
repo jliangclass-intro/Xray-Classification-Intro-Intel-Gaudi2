@@ -1,20 +1,23 @@
-# Specification: Run Scripts
+# Specification: Environment & Run Scripts
+
+## `setup_env.sh`
+- Automatically detects the execution environment (Slurm `sol` or `phoenix`, or local workstation) and activates the appropriate Conda/venv environment:
+  - **ASU SOL (`gaudi*` hostnames)**: Loads `mamba` and activates `gaudi-pytorch-vllm` (Intel Gaudi 2 SynapseAI PyTorch).
+  - **ASU SOL (A100 GPU nodes)**: Loads `mamba gcc-13.2.0-gcc-12.1.0` and activates `pytorch-gpu-2.3.1-cuda-12.1`.
+  - **ASU Phoenix (V100 GPU nodes)**: Loads `mamba gcc-12.3.0-vw` and activates `pytorch-gpu-2.3.1-cuda-12.1`.
+  - **Local Workstation**: Activates `$HOME/.venvs/torch-cuda/bin/activate` if present.
 
 ## `run.sh`
-- Calls `python src/train_v2_lightning.py` with passthrough of all arguments
-- Handles conda environment activation and module loading
+- Sources `setup_env.sh` and runs `python ${MY_PYTHON_CODE:-src/train_v2_lightning.py} "$@"` with passthrough of all Hydra CLI overrides.
 - Example usage:
-  - `./run.sh dataset=chestxray14 model=convnext_base train.batch_size=128 train.optimizer=adamw train.lr=1e-4`
-  - `./run.sh dataset=chestxray14 model=resnet50 train.batch_size=128 train.optimizer=adamw train.lr=1e-4`
-  - `./run.sh dataset=chestxray14 model=swin_base train.batch_size=128 train.optimizer=adamw train.lr=1e-4`
+  - `./run.sh dataset=chestxray14 model=resnet50 train.batch_size=64 train.optimizer=adam train.lr=2e-4`
+  - `MY_PYTHON_CODE=src/train_v1_classic.py ./run.sh dataset=chestxray14 model=resnet50`
 
-## `submit-all-slurm.sh`
-- SLURM batch submission script that submits 9 training jobs
-- Datasets: `chestxray14`, `chexpert`, `mimic`
-- Backbones: `convnext_base`, `resnet50`, `swin_base`
-- Training config: `batch_size=128`, `train.optimizer=adamw`, `lr=1e-4`
-- Each job runs independently with unique job name: `{dataset}-{backbone}`
-- The `submit_job()` function accepts a complete `bash run.sh` command string and wraps it with `sbatch --wrap`
-- Example: `submit_job "bash run.sh dataset=chestxray14 model=convnext_base train.batch_size=128 train.optimizer=adamw train.lr=1e-4"`
-- Usage: `./submit-all-slurm.sh`
-- Check job status: `squeue -u $USER`
+## Dataset & Backbone SLURM Scripts (`run-*-best.sh` & `run-*-adamw.sh`)
+- Pre-configured SLURM batch scripts for all 3 datasets (`xray14`, `chexpert`, `mimic`) and 3 backbones (`resnet50`, `convnext-base`, `swin_base`):
+  - `run-xray14-resnet50-best.sh`, `run-xray14-convnext-base-best.sh`, `run-xray14-swin_base-best.sh`
+  - `run-chexpert-resnet50-best.sh`, `run-chexpert-convnext-base-best.sh`, `run-chexpert-swin_base-best.sh`
+  - `run-mimic-resnet50-best.sh`, `run-mimic-convnext-base-best.sh`, `run-mimic-swin_base-best.sh`
+- Each script sources `setup_env.sh`, sets `OUTPUT_DIR="/scratch/$USER/outputs-Xray-Classification-Intro/$CLUSTER"`, and invokes `${MY_PYTHON_CODE:-src/train_v2_lightning.py}` while forwarding any extra CLI overrides (`"$@"`).
+- See `sbatch-examples.md` and `INTEL_GAUDI2_GUIDE.md` for `sbatch` submission examples on SOL (Gaudi 2 & A100) and Phoenix (V100).
+

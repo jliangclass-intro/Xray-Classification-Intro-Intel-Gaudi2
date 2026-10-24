@@ -2,58 +2,33 @@
 
 ## Implementation
 - Evaluation functions are in `src/evaluate.py`:
-  - `evaluate()`: Main evaluation function that runs model inference and computes metrics
-  - `calculate_subset_metrics()`: Calculate metrics for label subsets
-  - `multilabel_metrics()`: Calculate multilabel metrics from probabilities and targets
+  - `evaluate()`: Main evaluation function that runs model inference (supporting 4D single-crop and 5D multi-crop inputs, `bfloat16` autocast, and `hpu_mark_step()` on Intel Gaudi 2) and computes metrics.
+  - `calculate_multilabel_metrics()`: Computes macro `mean_auroc` and `mean_aupr` in `float32`.
+  - `calculate_per_label_auroc()`: Computes per-class AUROC values.
+  - `calculate_subset_metrics()`: Computes metrics for configured label subsets (`test_labels`).
+  - `save_predictions()`: Saves per-sample predicted probabilities to CSV.
+  - `save_val_auroc()`: Appends validation and test AUROC metrics to `auroc_list.csv`.
 
-## Metrics
-- Use torchmetrics:
-  - `MultilabelAUROC`
-  - `MultilabelAveragePrecision`
-- Call `update()` on each batch and `compute()` at end.
-- Use `ignore_index=-1` to skip uncertain labels.
-- Report `mean_auroc` and `mean_aupr` (macro) for all labels.
+## Metrics & Device Placement
+- Uses `torchmetrics`:
+  - `MultilabelAUROC(average="macro" | "none", ignore_index=-1)`
+  - `MultilabelAveragePrecision(average="macro", ignore_index=-1)`
+- **Hardware Parity (`_resolve_metric_device`)**:
+  - On **Intel Gaudi 2 (`hpu`)**, `torchmetrics` computation is automatically routed to `"cpu"` (`float32` / `int64`) so 64-bit integer casting, dynamic masking (`target != -1`), and sorting do not suffer from HPU TPC precision/fallback issues.
+  - On **NVIDIA CUDA (`cuda`)**, `torchmetrics` runs natively on GPU.
 
-## Label Subsets (test_labels)
-- If `test_labels` is defined in the dataset config, calculate metrics for specified label subsets.
-- `test_labels` is a dictionary mapping subset names to lists of label names.
-- Common subsets: `top5`, `top12`, `top6`, `top14`, etc.
-- For each subset, calculate:
-  - `{split}_auroc_{subset_name}` (e.g., `val_auroc_top5`, `test_auroc_top12`)
-  - `{split}_aupr_{subset_name}` (e.g., `val_aupr_top5`, `test_aupr_top12`)
-- Metrics are calculated for both validation and test sets.
-- Example config:
-  ```yaml
-  test_labels:
-    top5:
-      - Atelectasis
-      - Cardiomegaly
-      - Consolidation
-      - Edema
-      - Pleural Effusion
-    top12:
-      - Atelectasis
-      - Cardiomegaly
-      - Consolidation
-      - Edema
-      - Enlarged Cardiomediastinum
-      - Fracture
-      - Lung Lesion
-      - Lung Opacity
-      - Pleural Effusion
-      - Pleural Other
-      - Pneumonia
-      - Pneumothorax
-  ```
+## Label Subsets (`test_labels`)
+- If `test_labels` is defined in the dataset config, calculates metrics for each specified subset (`top5`, `top12`, `top6`, `top14`, etc.):
+  - `auroc_{subset_name}` and `aupr_{subset_name}` for both validation and test splits.
 
-## Predictions
-- Save both validation and test predictions at each evaluation step.
-- Saved in split-specific subdirectories: `val/` and `test/`
-- Filename format:
-  - `val/preds_epochXXX_iterYYYYYY.csv`
-  - `test/preds_epochXXX_iterYYYYYY.csv`
-- CSV columns (predictions only, no ground truth):
-  - `Path`: original image path from dataset CSV (before image_root is applied)
-  - `__key__`: original `__key__` column value from dataset CSV (if present in original dataset)
-  - `pred_<label>`: prediction probability for each label (rounded to 4 decimal places)
-- Implementation: `save_predictions()` function in `src/evaluate.py` (shared by both `train_v1_classic.py` and `train_v2_lightning.py`)
+## Multi-Crop Evaluation Strategies (`train_v2_lightning.py`)
+- Supports evaluating multiple crop strategies per validation step (configured via `validation.strategies`, e.g., `["nocrop", "center_crop", "ten_crop"]`).
+- In multi-GPU/multi-HPU DDP mode, gathers predictions across ranks and deduplicates DDP padding by sample path before computing global metrics on all ranks.
+
+## Saved Evaluation Files
+- **Prediction CSVs (`save_predictions`)**:
+  - `val/preds_epochXXX_iterYYYYYY.csv` and `test/preds_epochXXX_iterYYYYYY.csv` (plus `val_<strategy>/` and `test_<strategy>/` for `center_crop` / `ten_crop`).
+  - Columns: `Path`, `__key__` (if present), and `pred_<label>` (rounded to 4 decimal places; no ground-truth columns).
+- **AUROC Summary (`save_val_auroc`)**:
+  - `auroc_list.csv` in the run output directory, recording `epoch`, `iter`, `val_mean_auroc`, `test_mean_auroc`, and subset/crop AUROC columns at each evaluation step.
+
