@@ -24,7 +24,8 @@ This project provides a complete training pipeline for multi-label chest X-ray c
 ```
 Pytorch/
 ├── src/
-│   ├── train_v1_classic.py    # Main training script
+│   ├── train_v2_lightning.py  # Main PyTorch Lightning training script
+│   ├── train_v1_classic.py    # Classic PyTorch training script
 │   ├── dataset.py             # CSV-based dataset loader
 │   ├── evaluate.py            # Evaluation metrics and AUROC calculation
 │   └── utils.py               # Utility functions
@@ -40,6 +41,7 @@ Pytorch/
 │   │   └── swin_base.yaml
 │   └── train/                 # Training hyperparameters
 ├── run-*.sh                   # SLURM submission scripts
+├── INTEL_GAUDI2_GUIDE.md      # Guide for running & debugging on Intel Gaudi 2 HPU
 └── outputs/                   # Training outputs (created during training)
 ```
 
@@ -103,35 +105,47 @@ The project uses Hydra for configuration management. Main configuration files:
 
 ### Using SLURM Scripts (Recommended)
 
-Pre-configured scripts for each dataset and model combination:
+Pre-configured scripts for each dataset and model combination. These scripts inherently set safe defaults (`48:00:00`, `8` CPUs, `64G` RAM, `1` A100 GPU) and automatically `cd` into the correct directory to avoid Slurm initial path confusion.
 
 ```bash
 # ChestX-ray14
-./run-xray14-resnet50-adamw.sh
-./run-xray14-convnext-base.sh
-./run-xray14-swin_base-adamw.sh
+./run-xray14-resnet50-best.sh
+./run-xray14-convnext-base-best.sh
+./run-xray14-swin_base-best.sh
 
 # CheXpert
-./run-chexpert-resnet50-adamw.sh
-./run-chexpert-convnext-base.sh
-./run-chexpert-swin_base-adamw.sh
+./run-chexpert-resnet50-best.sh
+./run-chexpert-convnext-base-best.sh
+./run-chexpert-swin_base-best.sh
 
 # MIMIC-CXR
-./run-mimic-resnet50-adamw.sh
-./run-mimic-convnext-base.sh
-./run-mimic-swin_base-adamw.sh
+./run-mimic-resnet50-best.sh
+./run-mimic-convnext-base-best.sh
+./run-mimic-swin_base-best.sh
+```
+
+### Modify configuration
+```bash
+# ./run-xray14-convnext-base-best.sh dataset.dataset_root=$XRAY_DATASET
+# ./run-xray14-convnext-base-best.sh debug=True dataset.dataset_root=$XRAY_DATASET train.batch_size=128
+```
+
+### Intel Gaudi 2 HPU
+See **[`INTEL_GAUDI2_GUIDE.md`](./INTEL_GAUDI2_GUIDE.md)** for full instructions on running on Intel Gaudi 2 (`gaudi*` nodes on SOL) and required HPU adjustments (`htcore.mark_step()`, FP32 loss reduction, CPU metric evaluation, and `lightning-habana`) to match CUDA training accuracy:
+```bash
+HABANA_VISIBLE_DEVICES=0 MY_PYTHON_CODE=src/train_v1_classic.py ./run-xray14-resnet50-best.sh train.batch_size=64
 ```
 
 ### Direct Python Execution
 
 ```bash
-python src/train_v1_classic.py dataset=chestxray14 model=resnet50 train.batch_size=128 train.optimizer=adamw train.lr=1e-4
+python src/train_v2_lightning.py dataset=chestxray14 model=resnet50 train.batch_size=128 train.optimizer=adamw train.lr=1e-4
 ```
 
 ### Hydra Overrides
 
 ```bash
-python src/train_v1_classic.py \
+python src/train_v2_lightning.py \
     dataset=chexpert \
     model=convnext_base \
     train.epochs=20 \
@@ -188,8 +202,7 @@ Validation Per-Label AUROC:
 To prepare the environment on SOL cluster:
 
 ```bash
-module load mamba
-module load gcc-12.1.0-gcc-11.2.0  # for SOL
+module load mamba gcc-12.1.0-gcc-11.2.0
 source activate pytorch-gpu-2.3.1-cuda-12.1
 pip install --user --upgrade \
     arrow pyarrow pandas lightning timm hydra-core
@@ -197,11 +210,20 @@ pip install --user --upgrade \
 
 ## ASU PHXRC Cluster
 
-To create full environment:
+### To use minimal environment:
+
+```bash
+module load mamba gcc-12.3.0-vw
+source activate pytorch-gpu-2.3.1-cuda-12.1
+pip install --user --upgrade \
+    arrow pyarrow pandas lightning timm hydra-core
+```
+
+### To create full environment:
 
 ```bash
 module load mamba
-mamba create -n torch-cuda-mamba python=3.12
+mamba create -n torch-cuda-mamba python=3.13
 source activate torch-cuda-mamba
 mamba install torch torchvision torchmetrics transformers jupyter matplotlib scikit-image scikit-learn timm einops opencv-python pycocotools
 ```

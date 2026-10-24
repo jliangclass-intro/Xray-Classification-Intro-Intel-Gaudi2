@@ -1,0 +1,11 @@
+# @package _group_
+name: reduce_lr_on_plateau
+mode: ${train.monitor_mode}
+factor: 0.2           # Was 0.1; 0.2 is better for fine-tuning
+patience: 2           # Was 10; 2 is ideal for a 20-epoch run
+threshold: 0.0001
+min_lr: 1e-7          # Was 1e-5; allows for deeper convergence
+cooldown: 1           # prevent back-to-back drops
+verbose: True         # track changes in logs
+warmup_epochs: 3      # 3 is reasonable for 20-epoch run
+monitor: "mean_auroc"

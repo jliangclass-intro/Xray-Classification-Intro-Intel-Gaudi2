@@ -1,5 +1,19 @@
+outputs
 outputs/
+output-*
+plots/
 *nogit*
+*.out
+*.err
+*.local.*
+.agent/
+.ruff_cache/
+*.code-workspace
+debug_csv.py
+inspect_tmp.py
+test-slurm.sh
+plan-*.md
+.test_output/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

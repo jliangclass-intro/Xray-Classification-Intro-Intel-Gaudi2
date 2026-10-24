@@ -1,0 +1,2 @@
+# @package validation
+strategies: [ten_crop, center_crop, nocrop]

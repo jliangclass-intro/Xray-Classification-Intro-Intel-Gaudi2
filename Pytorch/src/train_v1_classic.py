@@ -1,8 +1,9 @@
 import os
 import time
 import logging
+import contextlib
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -18,17 +19,16 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.utils import to_absolute_path
 
+from dataset import CSVDataset
+from utils import ensure_dir, get_device, get_best_accelerator, seed_everything
+from evaluate import evaluate, save_predictions, save_val_auroc
+
 # Register custom resolver for formatting learning rate
 def format_lr(lr: float) -> str:
     """Format learning rate by replacing dots with underscores."""
     return str(lr).replace(".", "_")
 
-# Register the resolver
 OmegaConf.register_new_resolver("format_lr", format_lr)
-
-from dataset import CSVDataset
-from utils import ensure_dir, get_device, seed_everything
-from evaluate import evaluate, calculate_subset_metrics, save_predictions, save_val_auroc
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,11 @@ if not logger.handlers:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _state_dict_cpu(model: nn.Module) -> dict:
+    """Copy model state dict to CPU. Avoids HPU/Gaudi serialization errors on torch.save."""
+    return {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
 
 class MaskedBCEWithLogitsLoss(nn.Module):
@@ -271,6 +276,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     device = get_device()
+    device_type = get_best_accelerator()
 
     model = build_model(model_cfg.get("backbone", "resnet50"), num_classes, model_cfg.get("pretrained", True))
     model.to(device)
@@ -281,10 +287,44 @@ def main(cfg: DictConfig) -> None:
 
     loss_fn = MaskedBCEWithLogitsLoss()
 
+    # Mixed precision: prefer bf16 when supported (Ampere+), else fp16 (AMP) when accelerator available
+    use_amp = device_type != "cpu"
+    bf16_supported = False
+    if device_type == "cuda" and torch.cuda.is_available():
+        bf16_supported = torch.cuda.is_bf16_supported()
+        if bf16_supported:
+            major, _ = torch.cuda.get_device_capability()
+            if major < 8:
+                logger.info(
+                    f"CUDA architecture (compute capability {major}.x) "
+                    "reports bfloat16 support, but it may cause engine errors "
+                    "on non-Ampere+ GPUs. Falling back to float16 (AMP)."
+                )
+                bf16_supported = False
+    elif device_type == "hpu":
+        bf16_supported = True
+        
+    use_bf16 = use_amp and bf16_supported
+    if use_bf16:
+        autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+        scaler = None
+    elif use_amp:
+        autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.float16)
+        scaler = (
+            torch.amp.GradScaler(device_type)
+            if hasattr(torch.amp, "GradScaler")
+            else (torch.amp.GradScaler() if device_type == "cuda" else None)
+        )
+    else:
+        autocast_ctx = contextlib.nullcontext()
+        scaler = None
+
     weight_decay = float(train_cfg.get("weight_decay", 1e-4))
 
     if opt_type == "adamw":
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif opt_type == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif opt_type == "sgd":
         optimizer = optim.SGD(
             model.parameters(),
@@ -296,8 +336,44 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(f"Unsupported optimizer: {opt_type}")
 
     epochs = int(train_cfg.get("epochs", 10))
-    eval_every = int(train_cfg.get("eval_every", 1))
+    eval_every_iter = int(train_cfg.get("eval_every_iter", 1000))
     should_save_predictions = bool(train_cfg.get("save_predictions", True))
+    debug = bool(OmegaConf.select(cfg, "debug", default=False))
+
+    # Create scheduler
+    scheduler_cfg = cfg.get("scheduler")
+    scheduler = None
+    if scheduler_cfg and scheduler_cfg.get("name") != "none":
+        scheduler_name = scheduler_cfg.name.lower()
+        if scheduler_name == "reduce_lr_on_plateau":
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode=scheduler_cfg.get("mode", "min"),
+                factor=scheduler_cfg.get("factor", 0.2),
+                patience=scheduler_cfg.get("patience", 2),
+                threshold=scheduler_cfg.get("threshold", 0.0001),
+                cooldown=scheduler_cfg.get("cooldown", 1),
+                min_lr=float(scheduler_cfg.get("min_lr", 1e-7)),
+                verbose=scheduler_cfg.get("verbose", True)
+            )
+            
+            warmup_epochs = scheduler_cfg.get("warmup_epochs", 0)
+            if warmup_epochs > 0:
+                warmup_scheduler = optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.01, total_iters=warmup_epochs
+                )
+                scheduler = optim.lr_scheduler.SequentialLR(
+                    optimizer, schedulers=[warmup_scheduler, scheduler], milestones=[warmup_epochs]
+                )
+        elif scheduler_name == "cosine_annealing":
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=scheduler_cfg.get("T_max", epochs),
+                eta_min=float(scheduler_cfg.get("eta_min", 1e-5)),
+            )
+        else:
+            logger.warning(f"Unsupported scheduler: {scheduler_name}, using none")
+
 
     monitor_name = train_cfg.get("monitor", "mean_auroc")
     monitor_mode = train_cfg.get("monitor_mode", "max")
@@ -310,6 +386,7 @@ def main(cfg: DictConfig) -> None:
     patience = int(train_cfg.get("patience", 10))
     patience_counter = 0
     global_iter = 0
+    eval_count = 0
     start_time = time.time()
     
     # Log all configuration before training starts
@@ -353,11 +430,22 @@ def main(cfg: DictConfig) -> None:
     if opt_type == "sgd":
         logger.info(f"  Momentum: {train_cfg.get('momentum', 0.9)}")
     logger.info(f"  Seed: {train_cfg.get('seed', 42)}")
-    logger.info(f"  Eval Every: {eval_every} epochs")
+    logger.info(f"  Eval Every Iter: {eval_every_iter}")
     logger.info(f"  Monitor: {monitor_name} ({monitor_mode})")
-    logger.info(f"  Patience: {patience} epochs")
+    logger.info(f"  Patience: {patience} evals")
     logger.info(f"  Save Predictions: {should_save_predictions}")
+    if scheduler:
+        logger.info(f"  Scheduler: {scheduler_cfg.name}")
+        for k, v in scheduler_cfg.items():
+            if k != "name":
+                logger.info(f"    {k}: {v}")
+    else:
+        logger.info("  Scheduler: None")
+    
     logger.info(f"  Save Best Model: {train_cfg.get('save_best_model', True)}")
+    logger.info(f"  Debug (1 batch + eval + exit): {debug}")
+    precision_str = "bf16-mixed" if use_bf16 else ("16-mixed (AMP)" if use_amp else "32-true")
+    logger.info(f"  Precision (AMP): {precision_str}")
     logger.info("")
     logger.info("Device Configuration:")
     logger.info(f"  Device: {device}")
@@ -372,7 +460,6 @@ def main(cfg: DictConfig) -> None:
         loss_meter = AverageMeter()
         batch_time = AverageMeter()
         data_time = AverageMeter()
-        epoch_start = time.time()
         end = time.time()
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
@@ -383,10 +470,16 @@ def main(cfg: DictConfig) -> None:
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(images)
-            loss = loss_fn(logits, labels)
-            loss.backward()
-            optimizer.step()
+            with autocast_ctx:
+                logits = model(images)
+                loss = loss_fn(logits, labels)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             global_iter += 1
 
@@ -414,82 +507,116 @@ def main(cfg: DictConfig) -> None:
                     f"Time {seconds_to_hms(elapsed)}/{seconds_to_hms(eta)} {temp_str}"
                 )
 
-        if epoch % eval_every == 0:
-            val_metrics, val_probs, val_targets, val_paths, val_keys = evaluate(model, val_loader, device, label_names, label_subsets)
-            test_metrics, test_probs, test_targets, test_paths, test_keys = evaluate(model, test_loader, device, label_names, label_subsets)
-            
-            # Prefix metrics with split name for clarity
-            val_metrics_prefixed = {f"val_{key}": value for key, value in val_metrics.items()}
-            test_metrics_prefixed = {f"test_{key}": value for key, value in test_metrics.items()}
-            
-            metric_value = val_metrics.get(monitor_name, float("nan"))
-            
-            # Display mean AUROC and per-label AUROC
-            val_mean_auroc = val_metrics.get("mean_auroc", float("nan"))
-            val_per_label_auroc = val_metrics.get("per_label_auroc", [])
-            test_mean_auroc = test_metrics.get("mean_auroc", float("nan"))
-            test_per_label_auroc = test_metrics.get("per_label_auroc", [])
-            
-            logger.info("=" * 80)
-            logger.info(f"Epoch {epoch} Evaluation Results")
-            logger.info("=" * 80)
-            logger.info(f"Validation Mean AUROC: {val_mean_auroc:.4f}")
-            logger.info(f"Test Mean AUROC: {test_mean_auroc:.4f}")
-            logger.info("")
-            logger.info("Validation Per-Label AUROC:")
-            for i, (label_name, auroc) in enumerate(zip(label_names, val_per_label_auroc)):
-                auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "N/A"
-                logger.info(f"  {label_name}: {auroc_str}")
-            logger.info("")
-            logger.info("Test Per-Label AUROC:")
-            for i, (label_name, auroc) in enumerate(zip(label_names, test_per_label_auroc)):
-                auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "N/A"
-                logger.info(f"  {label_name}: {auroc_str}")
-            logger.info("=" * 80)
-            
-            print(f"Val metrics: {val_metrics_prefixed}")
-            print(f"Test metrics: {test_metrics_prefixed}")
-
-            if should_save_predictions:
-                # Save both validation and test predictions together
-                save_predictions(output_dir, "val", epoch, global_iter, val_paths, val_probs, val_targets, label_names, keys=val_keys)
-                save_predictions(output_dir, "test", epoch, global_iter, test_paths, test_probs, test_targets, label_names, keys=test_keys)
-
-            # Check if this is the best validation AUROC
-            val_mean_auroc = val_metrics.get("mean_auroc", -float("inf"))
-            is_best_auroc = val_mean_auroc > best_val_auroc
-            if is_best_auroc:
-                best_val_auroc = val_mean_auroc
-            
-            # Save val_auroc.csv
-            save_val_auroc(
-                output_dir,
-                epoch,
-                global_iter,
-                val_metrics,
-                test_metrics=test_metrics,
-                label_subsets=label_subsets,
-                is_best=is_best_auroc,
-            )
-
-            is_better = metric_value > best_metric if monitor_mode == "max" else metric_value < best_metric
-            if is_better:
-                best_metric = metric_value
-                best_epoch = epoch
-                patience_counter = 0  # Reset patience counter when metric improves
-                torch.save(model.state_dict(), os.path.join(checkpoints_dir, "best_model.pt"))
-                logger.info(f"New best {monitor_name}: {best_metric:.4f} (epoch {epoch})")
-            else:
-                patience_counter += 1
-                logger.info(f"No improvement in {monitor_name} for {patience_counter}/{patience} epochs")
-            
-            # Early stopping check
-            if patience_counter >= patience:
-                logger.info(f"Early stopping triggered: {monitor_name} did not improve for {patience} epochs")
-                logger.info(f"Best {monitor_name}: {best_metric:.4f} at epoch {best_epoch}")
+            if debug:
+                logger.info("Debug: 1 batch done, running evaluation then exiting.")
                 break
 
-    torch.save(model.state_dict(), os.path.join(checkpoints_dir, "last_model.pt"))
+            if debug or (global_iter % eval_every_iter == 0):
+                eval_count += 1
+                val_metrics, val_probs, val_targets, val_paths, val_keys = evaluate(model, val_loader, device, label_names, label_subsets)
+                test_metrics, test_probs, test_targets, test_paths, test_keys = evaluate(model, test_loader, device, label_names, label_subsets)
+                
+                # Prefix metrics with split name for clarity
+                val_metrics_prefixed = {f"val_{key}": value for key, value in val_metrics.items()}
+                test_metrics_prefixed = {f"test_{key}": value for key, value in test_metrics.items()}
+                
+                metric_value = val_metrics.get(monitor_name, float("nan"))
+                
+                # Display mean AUROC and per-label AUROC
+                val_mean_auroc = val_metrics.get("mean_auroc", float("nan"))
+                val_per_label_auroc = val_metrics.get("per_label_auroc", [])
+                test_mean_auroc = test_metrics.get("mean_auroc", float("nan"))
+                test_per_label_auroc = test_metrics.get("per_label_auroc", [])
+                
+                logger.info("=" * 80)
+                logger.info(f"Iter {global_iter} (Epoch {epoch}) Evaluation Results")
+                logger.info("=" * 80)
+                logger.info(f"Validation Mean AUROC: {val_mean_auroc:.4f}")
+                logger.info(f"Test Mean AUROC: {test_mean_auroc:.4f}")
+                logger.info("")
+                logger.info("Validation Per-Label AUROC:")
+                for i, (label_name, auroc) in enumerate(zip(label_names, val_per_label_auroc)):
+                    auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "N/A"
+                    logger.info(f"  {label_name}: {auroc_str}")
+                logger.info("")
+                logger.info("Test Per-Label AUROC:")
+                for i, (label_name, auroc) in enumerate(zip(label_names, test_per_label_auroc)):
+                    auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "N/A"
+                    logger.info(f"  {label_name}: {auroc_str}")
+                logger.info("=" * 80)
+                
+                print(f"Val metrics: {val_metrics_prefixed}")
+                print(f"Test metrics: {test_metrics_prefixed}")
+
+                if should_save_predictions:
+                    # Save both validation and test predictions together
+                    save_predictions(output_dir, "val", epoch, global_iter, val_paths, val_probs, val_targets, label_names, keys=val_keys)
+                    save_predictions(output_dir, "test", epoch, global_iter, test_paths, test_probs, test_targets, label_names, keys=test_keys)
+
+                # Check if this is the best validation AUROC
+                val_mean_auroc = val_metrics.get("mean_auroc", -float("inf"))
+                is_best_auroc = val_mean_auroc > best_val_auroc
+
+                if is_best_auroc:
+                    best_val_auroc = val_mean_auroc
+                
+                # Save val_auroc.csv
+                save_val_auroc(
+                    output_dir,
+                    epoch,
+                    global_iter,
+                    val_metrics,
+                    test_metrics=test_metrics,
+                    label_subsets=label_subsets,
+                    is_best=is_best_auroc,
+                )
+
+                is_better = metric_value > best_metric if monitor_mode == "max" else metric_value < best_metric
+                if is_better:
+                    best_metric = metric_value
+                    best_epoch = eval_count
+                    patience_counter = 0  # Reset patience counter when metric improves
+                    torch.save(_state_dict_cpu(model), os.path.join(checkpoints_dir, "best_model.pt"))
+                    logger.info(f"New best {monitor_name}: {best_metric:.4f} (iter {global_iter})")
+                else:
+                    patience_counter += 1
+                    logger.info(f"No improvement in {monitor_name} for {patience_counter}/{patience} evals")
+
+                # Update scheduler (on iter scale)
+                if scheduler is not None:
+                    if isinstance(scheduler, optim.lr_scheduler.SequentialLR):
+                        # The second scheduler is ReduceLROnPlateau
+                        if eval_count > warmup_epochs:
+                            scheduler.schedulers[1].step(val_metrics[monitor_name])
+                        else:
+                            scheduler.step()
+                    elif isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                        scheduler.step(val_metrics[monitor_name])
+                    else:
+                        scheduler.step()
+
+                if patience_counter >= patience:
+                    logger.info(f"Early stopping triggered: {monitor_name} did not improve for {patience} evals")
+                    logger.info(f"Best {monitor_name}: {best_metric:.4f} at eval {best_epoch}")
+                    break
+
+                if debug:
+                    logger.info("Debug: evaluation done, exiting.")
+                    break
+                    
+                # Switch model back to training mode after evaluation
+                model.train()
+                
+        # Early stopping breakout from epoch loop
+        if patience_counter >= patience:
+            break
+
+        # Save model of this epoch
+        torch.save(_state_dict_cpu(model), os.path.join(checkpoints_dir, f"epoch_{epoch}.pt"))
+        logger.info(f"Saved model for epoch {epoch}")
+
+    if not debug:
+        torch.save(_state_dict_cpu(model), os.path.join(checkpoints_dir, "last_model.pt"))
 
 
 if __name__ == "__main__":

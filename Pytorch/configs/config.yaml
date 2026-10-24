@@ -2,6 +2,8 @@ defaults:
   - dataset: chestxray14
   - model: resnet50
   - train: default
+  - validation: three_validation
+  - scheduler: reduce_lr_on_plateau
   - logger: aim
   - override hydra/hydra_logging: none
   - override hydra/job_logging: none
@@ -9,10 +11,14 @@ defaults:
 
 hydra:
   run:
-    dir: outputs/${dataset.name}
+    # dir: outputs/${dataset.name}
+    dir: output-cuda-$(date +%Y%m%d)-$(date +%H%M%S)
   job:
     chdir: true
   output_subdir: ${run_name}/.hydra
 
-# run_name constructed from config values: {dataset_name}_{backbone}_{optimizer}_{lr}_{date}_{time}
-run_name: ${dataset.name}_${model.backbone}_${train.optimizer}_${format_lr:${train.lr}}_${now:%Y%m%d}_${now:%H%M%S}
+# run_name: use RUN_TIMESTAMP when set (e.g. from run_on_cuda.sh); do not use ${now:...} as default (differs per process and causes duplicate folders)
+run_name: ${dataset.name}_${model.backbone}_${train.optimizer}_${format_lr:${train.lr}}_${oc.env:RUN_TIMESTAMP,run}
+
+# Debug: run 1 training batch, then evaluation, then exit (override with --debug or debug=true)
+debug: false

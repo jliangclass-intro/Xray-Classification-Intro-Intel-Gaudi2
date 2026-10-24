@@ -10,27 +10,13 @@ import torch.nn as nn
 
 from utils import ensure_dir
 
-# Try to import torchmetrics, fallback to sklearn if not available
-try:
-    from torchmetrics.classification import MultilabelAUROC, MultilabelAveragePrecision
-    TORCHMETRICS_AVAILABLE = True
-except ImportError:
-    TORCHMETRICS_AVAILABLE = False
-
-try:
-    from sklearn.metrics import roc_auc_score, average_precision_score
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-if not TORCHMETRICS_AVAILABLE and not SKLEARN_AVAILABLE:
-    logging.warning("Neither torchmetrics nor sklearn available. Metrics calculation will fail.")
+from torchmetrics.classification import MultilabelAUROC, MultilabelAveragePrecision
 
 logger = logging.getLogger(__name__)
 
 
-def _calculate_metrics_torchmetrics(
-    probs: np.ndarray, targets: np.ndarray, device: Union[str, torch.device]
+def calculate_multilabel_metrics(
+    probs: np.ndarray, targets: np.ndarray, device: Union[str, torch.device] = "cpu"
 ) -> Tuple[float, float]:
     """
     Calculate multilabel metrics using torchmetrics.
@@ -72,90 +58,16 @@ def _calculate_metrics_torchmetrics(
     return mean_auroc, mean_aupr
 
 
-def _calculate_metrics_sklearn(
-    probs: np.ndarray, targets: np.ndarray, device: Union[str, torch.device]
-) -> Tuple[float, float]:
-    """
-    Calculate multilabel metrics using sklearn (fallback).
-    
-    Args:
-        probs: Probability predictions, shape (N, num_classes)
-        targets: Ground truth labels, shape (N, num_classes), -1 for ignored labels
-        device: Device parameter (ignored for sklearn, kept for API consistency)
-        
-    Returns:
-        Tuple of (mean_auroc, mean_aupr)
-    """
-    num_classes = probs.shape[1]
-    aurocs = []
-    auprs = []
-    
-    for c in range(num_classes):
-        # Mask out ignored labels (-1)
-        mask = targets[:, c] != -1
-        if mask.sum() == 0:
-            continue
-        
-        y_true = targets[mask, c]
-        y_score = probs[mask, c]
-        
-        # Skip if only one class present
-        if len(np.unique(y_true)) < 2:
-            continue
-        
-        try:
-            auroc = roc_auc_score(y_true, y_score)
-            aurocs.append(auroc)
-        except (ValueError, Exception):
-            pass
-        
-        try:
-            aupr = average_precision_score(y_true, y_score)
-            auprs.append(aupr)
-        except (ValueError, Exception):
-            pass
-    
-    mean_auroc = float(np.nanmean(aurocs)) if aurocs else float("nan")
-    mean_aupr = float(np.nanmean(auprs)) if auprs else float("nan")
-    
-    return mean_auroc, mean_aupr
-
-
-def calculate_multilabel_metrics(
-    probs: np.ndarray, targets: np.ndarray, device: Union[str, torch.device] = "cpu"
-) -> Tuple[float, float]:
-    """
-    Calculate multilabel metrics with automatic fallback.
-    
-    Uses torchmetrics if available, otherwise falls back to sklearn.
-    
-    Args:
-        probs: Probability predictions, shape (N, num_classes)
-        targets: Ground truth labels, shape (N, num_classes), -1 for ignored labels
-        device: Device to run metrics on (for torchmetrics)
-        
-    Returns:
-        Tuple of (mean_auroc, mean_aupr)
-    """
-    if TORCHMETRICS_AVAILABLE:
-        return _calculate_metrics_torchmetrics(probs, targets, device)
-    elif SKLEARN_AVAILABLE:
-        logger.debug("Using sklearn fallback for metrics calculation")
-        return _calculate_metrics_sklearn(probs, targets, device)
-    else:
-        raise ImportError("Neither torchmetrics nor sklearn is available for metrics calculation.")
-
-
 def calculate_per_label_auroc(
     probs: np.ndarray, targets: np.ndarray, device: Union[str, torch.device] = "cpu"
 ) -> List[float]:
     """
-    Calculate AUROC for each individual label.
+    Calculate AUROC for each individual label using torchmetrics.
     
     Args:
         probs: Probability predictions, shape (N, num_classes)
         targets: Ground truth labels, shape (N, num_classes), -1 for ignored labels
-        device: Device to run metrics on (for torchmetrics)
+        device: Device to run metrics on 
         
     Returns:
         List of AUROC values for each label (nan if cannot be calculated)
@@ -163,69 +75,23 @@ def calculate_per_label_auroc(
     num_classes = probs.shape[1]
     per_label_aurocs = []
     
-    if TORCHMETRICS_AVAILABLE:
-        # Use torchmetrics for per-label calculation
-        probs_tensor = torch.from_numpy(probs).to(device)
-        targets_tensor = torch.from_numpy(targets).to(device)
-        
-        # Use MultilabelAUROC with average="none" to get per-label metrics
-        auroc_metric = MultilabelAUROC(
-            num_labels=num_classes,
-            average="none",  # Return per-label, not averaged
-            ignore_index=-1,
-        ).to(device)
-        
-        try:
-            auroc_metric.update(probs_tensor, targets_tensor.long())
-            auroc_per_label = auroc_metric.compute().cpu().numpy()
-            per_label_aurocs = [float(auroc) if not np.isnan(auroc) else float("nan") for auroc in auroc_per_label]
-        except (ValueError, Exception) as e:
-            # Fallback to sklearn if torchmetrics fails
-            logger.debug(f"torchmetrics per-label calculation failed: {e}, falling back to sklearn")
-            for c in range(num_classes):
-                mask = targets[:, c] != -1
-                if mask.sum() == 0:
-                    per_label_aurocs.append(float("nan"))
-                    continue
-                
-                y_true = targets[mask, c]
-                y_score = probs[mask, c]
-                
-                if len(np.unique(y_true)) < 2:
-                    per_label_aurocs.append(float("nan"))
-                    continue
-                
-                try:
-                    auroc = roc_auc_score(y_true, y_score)
-                    per_label_aurocs.append(float(auroc))
-                except (ValueError, Exception):
-                    per_label_aurocs.append(float("nan"))
+    probs_tensor = torch.from_numpy(probs).to(device)
+    targets_tensor = torch.from_numpy(targets).to(device)
     
-    elif SKLEARN_AVAILABLE:
-        # Use sklearn for per-label calculation
-        for c in range(num_classes):
-            # Mask out ignored labels (-1)
-            mask = targets[:, c] != -1
-            if mask.sum() == 0:
-                per_label_aurocs.append(float("nan"))
-                continue
-            
-            y_true = targets[mask, c]
-            y_score = probs[mask, c]
-            
-            # Skip if only one class present
-            if len(np.unique(y_true)) < 2:
-                per_label_aurocs.append(float("nan"))
-                continue
-            
-            try:
-                auroc = roc_auc_score(y_true, y_score)
-                per_label_aurocs.append(float(auroc))
-            except (ValueError, Exception):
-                per_label_aurocs.append(float("nan"))
-    else:
-        raise ImportError("Neither torchmetrics nor sklearn is available for metrics calculation.")
+    auroc_metric = MultilabelAUROC(
+        num_labels=num_classes,
+        average="none",
+        ignore_index=-1,
+    ).to(device)
     
+    try:
+        auroc_metric.update(probs_tensor, targets_tensor.long())
+        auroc_per_label = auroc_metric.compute().cpu().numpy()
+        per_label_aurocs = [float(auroc) if not np.isnan(auroc) else float("nan") for auroc in auroc_per_label]
+    except Exception as e:
+        logger.warning(f"Failed to calculate per-label auroc: {e}")
+        per_label_aurocs = [float("nan")] * num_classes
+
     return per_label_aurocs
 
 
@@ -317,6 +183,12 @@ def evaluate(
     labels = labels.to(device)
     
     with torch.no_grad():
+        # Check if 5D tensor (B, n_crops, C, H, W)
+        n_crops = 1
+        if images.dim() == 5:
+            bs, n_crops, c, h, w = images.size()
+            images = images.view(-1, c, h, w)
+            
         logits = model(images)
         num_classes = logits.shape[1]
         
@@ -330,6 +202,9 @@ def evaluate(
     with torch.no_grad():
         # Process first batch
         probs = torch.sigmoid(logits)
+        if n_crops > 1:
+            probs = probs.view(bs, n_crops, -1).mean(dim=1)
+            
         all_probs.append(probs.cpu().numpy())
         all_targets.append(labels.cpu().numpy())
         all_original_paths.extend(original_paths)
@@ -341,8 +216,16 @@ def evaluate(
             images = images.to(device)
             labels = labels.to(device)
 
+            n_crops = 1
+            if images.dim() == 5:
+                bs, n_crops, c, h, w = images.size()
+                images = images.view(-1, c, h, w)
+
             logits = model(images)
             probs = torch.sigmoid(logits)
+
+            if n_crops > 1:
+                probs = probs.view(bs, n_crops, -1).mean(dim=1)
 
             all_probs.append(probs.cpu().numpy())
             all_targets.append(labels.cpu().numpy())
@@ -444,73 +327,57 @@ def save_val_auroc(
     """
     csv_path = os.path.join(output_dir, "auroc_list.csv")
     
-    # Build row data - round all AUROC values to 4 decimal places
     row_data = {
         "epoch": epoch,
         "iter": iteration,
-        "val_mean_auroc": round(val_metrics.get("mean_auroc", float("nan")), 4),
     }
     
-    # Add validation subset AUROCs (if defined in label_subsets or in metrics)
-    if label_subsets is not None:
-        for subset_name in sorted(label_subsets.keys()):
-            key = f"auroc_{subset_name}"
-            val = val_metrics.get(key, float("nan"))
-            row_data[f"val_auroc_{subset_name}"] = round(val, 4) if not np.isnan(val) else val
-    else:
-        # Extract subset metrics from val_metrics keys
-        for key in sorted(val_metrics.keys()):
-            if key.startswith("auroc_") and key != "mean_auroc":
-                # Extract subset name (e.g., "top5" from "auroc_top5")
-                subset_name = key.replace("auroc_", "")
-                val = val_metrics.get(key, float("nan"))
-                row_data[f"val_auroc_{subset_name}"] = round(val, 4) if not np.isnan(val) else val
-    
-    # Add test metrics for every epoch (not just best)
-    if test_metrics is not None:
-        test_val = test_metrics.get("mean_auroc", float("nan"))
-        row_data["test_mean_auroc"] = round(test_val, 4) if not np.isnan(test_val) else test_val
+    # Process validation metrics
+    for key, val in val_metrics.items():
+        if key.startswith("mean_aupr") or key.startswith("per_label_auroc"):
+            continue
+            
+        if key == "mean_auroc":
+            row_name = "val_mean_auroc"
+        elif key.startswith("mean_auroc_"):
+            row_name = f"val_{key}"
+        elif key.startswith("auroc_"):
+            subset_name = key.replace("auroc_", "")
+            row_name = f"val_auroc_{subset_name}"
+        else:
+            row_name = f"val_{key}"
+            
+        row_data[row_name] = round(val, 4) if not np.isnan(val) else val
         
-        # Add test subset AUROCs
-        if label_subsets is not None:
-            for subset_name in sorted(label_subsets.keys()):
-                key = f"auroc_{subset_name}"
-                val = test_metrics.get(key, float("nan"))
-                row_data[f"test_auroc_{subset_name}"] = round(val, 4) if not np.isnan(val) else val
-        else:
-            # Extract subset metrics from test_metrics keys
-            for key in sorted(test_metrics.keys()):
-                if key.startswith("auroc_") and key != "mean_auroc":
-                    # Extract subset name (e.g., "top5" from "auroc_top5")
-                    subset_name = key.replace("auroc_", "")
-                    val = test_metrics.get(key, float("nan"))
-                    row_data[f"test_auroc_{subset_name}"] = round(val, 4) if not np.isnan(val) else val
-    else:
-        # Add empty test columns when test_metrics not provided
-        row_data["test_mean_auroc"] = float("nan")
-        # Add empty test subset columns
-        if label_subsets is not None:
-            for subset_name in sorted(label_subsets.keys()):
-                row_data[f"test_auroc_{subset_name}"] = float("nan")
-        else:
-            # Try to infer from val_metrics what test columns might be needed
-            for key in sorted(val_metrics.keys()):
-                if key.startswith("auroc_") and key != "mean_auroc":
-                    # Extract subset name (e.g., "top5" from "auroc_top5")
-                    subset_name = key.replace("auroc_", "")
-                    row_data[f"test_auroc_{subset_name}"] = float("nan")
-    
+    # Process test metrics
+    if test_metrics is not None:
+        for key, val in test_metrics.items():
+            if key.startswith("mean_aupr") or key.startswith("per_label_auroc"):
+                continue
+                
+            if key == "mean_auroc":
+                row_name = "test_mean_auroc"
+            elif key.startswith("mean_auroc_"):
+                row_name = f"test_{key}"
+            elif key.startswith("auroc_"):
+                subset_name = key.replace("auroc_", "")
+                row_name = f"test_{subset_name}_mean_auroc"
+            else:
+                row_name = f"test_{key}"
+                
+            row_data[row_name] = round(val, 4) if not np.isnan(val) else val
+            
     # Create DataFrame and append to CSV
     df = pd.DataFrame([row_data])
     
-    # If file exists, append; otherwise create new
-    if os.path.exists(csv_path):
-        existing_df = pd.read_csv(csv_path)
-        # Combine and remove duplicates (keep last if same epoch/iter)
-        combined_df = pd.concat([existing_df, df], ignore_index=True)
-        # Remove duplicates based on epoch and iter, keeping the last one
-        combined_df = combined_df.drop_duplicates(subset=["epoch", "iter"], keep="last")
-        combined_df = combined_df.sort_values(by=["epoch", "iter"])
-        combined_df.to_csv(csv_path, index=False)
+    # If file exists and has content, append; otherwise create new
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        try:
+            existing_df = pd.read_csv(csv_path)
+            # Combine and write directly as requested
+            combined_df = pd.concat([existing_df, df], ignore_index=True)
+            combined_df.to_csv(csv_path, index=False)
+        except pd.errors.EmptyDataError:
+            df.to_csv(csv_path, index=False)
     else:
         df.to_csv(csv_path, index=False)

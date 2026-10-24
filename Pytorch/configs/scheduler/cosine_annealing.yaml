@@ -1,0 +1,4 @@
+# @package _group_
+name: cosine_annealing
+T_max: ${train.epochs}
+eta_min: 1e-5
