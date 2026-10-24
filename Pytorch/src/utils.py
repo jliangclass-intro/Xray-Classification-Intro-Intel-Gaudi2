@@ -4,6 +4,19 @@ import random
 import numpy as np
 import torch
 
+# Register torch.hpu and HPU kernels on Intel Gaudi 2 when SynapseAI is installed,
+# even if PT_HPU_AUTOLOAD=1 is not set in the environment.
+try:
+    import habana_frameworks.torch.core as htcore
+except ImportError:
+    htcore = None
+
+
+def hpu_mark_step() -> None:
+    """Trigger graph compilation and execution step on Intel Gaudi 2 (HPU) in Lazy Mode."""
+    if htcore is not None and getattr(torch, "hpu", None) is not None and torch.hpu.is_available():
+        htcore.mark_step()
+
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -13,6 +26,12 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     if getattr(torch, "hpu", None) is not None and getattr(torch.hpu, "is_available", lambda: False)():
         getattr(torch.hpu, "manual_seed_all", lambda _: None)(seed)
+        if htcore is not None:
+            try:
+                import habana_frameworks.torch.hpu.random as htrandom
+                htrandom.manual_seed_all(seed)
+            except ImportError:
+                pass
 
 
 def get_best_accelerator() -> str:
@@ -30,3 +49,4 @@ def get_device() -> torch.device:
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+

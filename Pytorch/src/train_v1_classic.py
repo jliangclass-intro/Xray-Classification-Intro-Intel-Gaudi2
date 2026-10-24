@@ -20,7 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 from hydra.utils import to_absolute_path
 
 from dataset import CSVDataset
-from utils import ensure_dir, get_device, get_best_accelerator, seed_everything
+from utils import ensure_dir, get_device, get_best_accelerator, seed_everything, hpu_mark_step
 from evaluate import evaluate, save_predictions, save_val_auroc
 
 # Register custom resolver for formatting learning rate
@@ -28,7 +28,7 @@ def format_lr(lr: float) -> str:
     """Format learning rate by replacing dots with underscores."""
     return str(lr).replace(".", "_")
 
-OmegaConf.register_new_resolver("format_lr", format_lr)
+OmegaConf.register_new_resolver("format_lr", format_lr, replace=True)
 
 
 logger = logging.getLogger(__name__)
@@ -53,12 +53,17 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         self.register_buffer("pos_weight", pos_weight if pos_weight is not None else None)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Upcast to float32 so bfloat16 sum reduction over (batch_size * num_classes)
+        # does not lose mantissa precision on Intel Gaudi 2 (HPU) or Ampere+ GPUs.
+        logits = logits.float()
+        targets = targets.float()
         mask = targets != -1
         targets_clamped = torch.where(mask, targets, torch.zeros_like(targets))
+        pos_w = self.pos_weight.float() if self.pos_weight is not None else None
         loss = F.binary_cross_entropy_with_logits(
             logits,
             targets_clamped,
-            pos_weight=self.pos_weight,
+            pos_weight=pos_w,
             reduction="none",
         )
         loss = loss * mask.float()
@@ -253,30 +258,31 @@ def main(cfg: DictConfig) -> None:
         transform=val_tf,
     )
 
+    device = get_device()
+    device_type = get_best_accelerator()
+    use_pin_memory = device_type == "cuda"
+
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=int(train_cfg.get("batch_size", 64)),
         shuffle=True,
         num_workers=int(train_cfg.get("num_workers", 4)),
-        pin_memory=True,
+        pin_memory=use_pin_memory,
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds,
         batch_size=int(train_cfg.get("batch_size", 64)),
         shuffle=False,
         num_workers=int(train_cfg.get("num_workers", 4)),
-        pin_memory=True,
+        pin_memory=use_pin_memory,
     )
     test_loader = torch.utils.data.DataLoader(
         test_ds,
         batch_size=int(train_cfg.get("batch_size", 64)),
         shuffle=False,
         num_workers=int(train_cfg.get("num_workers", 4)),
-        pin_memory=True,
+        pin_memory=use_pin_memory,
     )
-
-    device = get_device()
-    device_type = get_best_accelerator()
 
     model = build_model(model_cfg.get("backbone", "resnet50"), num_classes, model_cfg.get("pretrained", True))
     model.to(device)
@@ -479,7 +485,11 @@ def main(cfg: DictConfig) -> None:
                 scaler.update()
             else:
                 loss.backward()
+                if device_type == "hpu":
+                    hpu_mark_step()
                 optimizer.step()
+                if device_type == "hpu":
+                    hpu_mark_step()
 
             global_iter += 1
 

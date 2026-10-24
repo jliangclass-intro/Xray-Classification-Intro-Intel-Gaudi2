@@ -1,6 +1,7 @@
 """Evaluation functions for model assessment."""
 import os
 import logging
+import contextlib
 from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
@@ -8,11 +9,19 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from utils import ensure_dir
+from utils import ensure_dir, hpu_mark_step
 
 from torchmetrics.classification import MultilabelAUROC, MultilabelAveragePrecision
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_metric_device(device: Union[str, torch.device]) -> Union[str, torch.device]:
+    """Return CPU when device is HPU so torchmetrics int64/sorting/ignore_index ops do not degrade."""
+    dev_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    if dev_type == "hpu":
+        return "cpu"
+    return device
 
 
 def calculate_multilabel_metrics(
@@ -24,32 +33,33 @@ def calculate_multilabel_metrics(
     Args:
         probs: Probability predictions, shape (N, num_classes)
         targets: Ground truth labels, shape (N, num_classes), -1 for ignored labels
-        device: Device to run metrics on
+        device: Device to run metrics on (automatically routed to CPU on HPU)
         
     Returns:
         Tuple of (mean_auroc, mean_aupr)
     """
     num_classes = probs.shape[1]
+    metric_device = _resolve_metric_device(device)
     
-    # Convert to torch tensors
-    probs_tensor = torch.from_numpy(probs).to(device)
-    targets_tensor = torch.from_numpy(targets).to(device)
+    # Convert to torch tensors in float32 / int64 for exact metric computation
+    probs_tensor = torch.from_numpy(probs).to(metric_device, dtype=torch.float32)
+    targets_tensor = torch.from_numpy(targets).to(metric_device, dtype=torch.long)
     
     # Initialize metrics
     auroc_metric = MultilabelAUROC(
         num_labels=num_classes,
         average="macro",
         ignore_index=-1,
-    ).to(device)
+    ).to(metric_device)
     aupr_metric = MultilabelAveragePrecision(
         num_labels=num_classes,
         average="macro",
         ignore_index=-1,
-    ).to(device)
+    ).to(metric_device)
     
     # Update metrics
-    auroc_metric.update(probs_tensor, targets_tensor.long())
-    aupr_metric.update(probs_tensor, targets_tensor.long())
+    auroc_metric.update(probs_tensor, targets_tensor)
+    aupr_metric.update(probs_tensor, targets_tensor)
     
     # Compute metrics
     mean_auroc = float(auroc_metric.compute().cpu().item())
@@ -67,25 +77,26 @@ def calculate_per_label_auroc(
     Args:
         probs: Probability predictions, shape (N, num_classes)
         targets: Ground truth labels, shape (N, num_classes), -1 for ignored labels
-        device: Device to run metrics on 
+        device: Device to run metrics on (automatically routed to CPU on HPU)
         
     Returns:
         List of AUROC values for each label (nan if cannot be calculated)
     """
     num_classes = probs.shape[1]
     per_label_aurocs = []
+    metric_device = _resolve_metric_device(device)
     
-    probs_tensor = torch.from_numpy(probs).to(device)
-    targets_tensor = torch.from_numpy(targets).to(device)
+    probs_tensor = torch.from_numpy(probs).to(metric_device, dtype=torch.float32)
+    targets_tensor = torch.from_numpy(targets).to(metric_device, dtype=torch.long)
     
     auroc_metric = MultilabelAUROC(
         num_labels=num_classes,
         average="none",
         ignore_index=-1,
-    ).to(device)
+    ).to(metric_device)
     
     try:
-        auroc_metric.update(probs_tensor, targets_tensor.long())
+        auroc_metric.update(probs_tensor, targets_tensor)
         auroc_per_label = auroc_metric.compute().cpu().numpy()
         per_label_aurocs = [float(auroc) if not np.isnan(auroc) else float("nan") for auroc in auroc_per_label]
     except Exception as e:
@@ -182,7 +193,13 @@ def evaluate(
     images = images.to(device)
     labels = labels.to(device)
     
-    with torch.no_grad():
+    dev_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    if dev_type == "hpu":
+        eval_autocast = torch.amp.autocast(device_type="hpu", dtype=torch.bfloat16)
+    else:
+        eval_autocast = contextlib.nullcontext()
+
+    with torch.no_grad(), eval_autocast:
         # Check if 5D tensor (B, n_crops, C, H, W)
         n_crops = 1
         if images.dim() == 5:
@@ -199,11 +216,13 @@ def evaluate(
                 f"Model output shape: {logits.shape}, label_names: {label_names[:5]}..."
             )
 
-    with torch.no_grad():
+    with torch.no_grad(), eval_autocast:
         # Process first batch
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(logits.float())
         if n_crops > 1:
             probs = probs.view(bs, n_crops, -1).mean(dim=1)
+        if dev_type == "hpu":
+            hpu_mark_step()
             
         all_probs.append(probs.cpu().numpy())
         all_targets.append(labels.cpu().numpy())
@@ -222,10 +241,12 @@ def evaluate(
                 images = images.view(-1, c, h, w)
 
             logits = model(images)
-            probs = torch.sigmoid(logits)
+            probs = torch.sigmoid(logits.float())
 
             if n_crops > 1:
                 probs = probs.view(bs, n_crops, -1).mean(dim=1)
+            if dev_type == "hpu":
+                hpu_mark_step()
 
             all_probs.append(probs.cpu().numpy())
             all_targets.append(labels.cpu().numpy())

@@ -21,7 +21,7 @@ from hydra.utils import to_absolute_path
 from hydra.core.hydra_config import HydraConfig
 
 from dataset import CSVDataset
-from utils import ensure_dir, get_best_accelerator, seed_everything
+from utils import ensure_dir, get_best_accelerator, seed_everything, hpu_mark_step
 from evaluate import evaluate, save_predictions, save_val_auroc
 
 # Register custom resolver for formatting learning rate
@@ -29,7 +29,7 @@ def format_lr(lr: float) -> str:
     """Format learning rate by replacing dots with underscores."""
     return str(lr).replace(".", "_")
 
-OmegaConf.register_new_resolver("format_lr", format_lr)
+OmegaConf.register_new_resolver("format_lr", format_lr, replace=True)
 
 
 logger = logging.getLogger(__name__)
@@ -64,12 +64,17 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         self.register_buffer("pos_weight", pos_weight if pos_weight is not None else None)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Upcast to float32 so bfloat16 sum reduction over (batch_size * num_classes)
+        # does not lose mantissa precision on Intel Gaudi 2 (HPU) or Ampere+ GPUs.
+        logits = logits.float()
+        targets = targets.float()
         mask = targets != -1
         targets_clamped = torch.where(mask, targets, torch.zeros_like(targets))
+        pos_w = self.pos_weight.float() if self.pos_weight is not None else None
         loss = F.binary_cross_entropy_with_logits(
             logits,
             targets_clamped,
-            pos_weight=self.pos_weight,
+            pos_weight=pos_w,
             reduction="none",
         )
         loss = loss * mask.float()
@@ -284,6 +289,17 @@ class XRayClassificationModule(L.LightningModule):
         
         return loss
     
+    def on_before_optimizer_step(self, optimizer):
+        """Ensure HPU Lazy Mode flushes the backward graph before optimizer.step()."""
+        if getattr(self.device, "type", None) == "hpu":
+            hpu_mark_step()
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        """Run optimizer step and flush HPU Lazy Mode graph afterwards."""
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure=optimizer_closure)
+        if getattr(self.device, "type", None) == "hpu":
+            hpu_mark_step()
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """Log training progress every 10th batch."""
         if should_log(batch_idx):
@@ -852,12 +868,15 @@ def main(cfg: DictConfig) -> None:
         transform=train_tf,
     )
     
+    device_type = get_best_accelerator()
+    use_pin_memory = device_type == "cuda"
+
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=int(train_cfg.get("batch_size", 64)),
         shuffle=True,
         num_workers=int(train_cfg.get("num_workers", 4)),
-        pin_memory=True,
+        pin_memory=use_pin_memory,
     )
     
     # Load evaluation strategies
@@ -898,14 +917,14 @@ def main(cfg: DictConfig) -> None:
             batch_size=int(train_cfg.get("batch_size", 64)),
             shuffle=False,
             num_workers=int(train_cfg.get("num_workers", 4)),
-            pin_memory=True,
+            pin_memory=use_pin_memory,
         ))
         test_loaders.append(torch.utils.data.DataLoader(
             test_ds,
             batch_size=int(train_cfg.get("batch_size", 64)),
             shuffle=False,
             num_workers=int(train_cfg.get("num_workers", 4)),
-            pin_memory=True,
+            pin_memory=use_pin_memory,
         ))
 
     # Create Lightning module
@@ -992,7 +1011,9 @@ def main(cfg: DictConfig) -> None:
     device_type = get_best_accelerator()
     eval_every_iter = int(train_cfg.get("eval_every_iter", 1000))
     
-    # Determine accelerator and devices (Lightning: gpu=cuda, hpu=Habana, cpu=cpu)
+    # Determine accelerator, devices, and strategy (Lightning: gpu=cuda, hpu=Habana, cpu=cpu)
+    trainer_strategy = "ddp"
+    trainer_plugins = None
     if device_type == "cuda":
         accelerator = "gpu"
         devices = "auto"
@@ -1008,13 +1029,29 @@ def main(cfg: DictConfig) -> None:
                 logger.info(f"  GPU {i}: {name} (total memory: {total_gb:.2f} GB)")
             logger.info("=" * 80)
     elif device_type == "hpu":
-        accelerator = "hpu"
         _hpu_count = getattr(torch.hpu, "device_count", None)
         n_hpu = (_hpu_count() if callable(_hpu_count) else _hpu_count) if _hpu_count is not None else 0
-        devices = "auto" if n_hpu else 1
+        try:
+            from lightning_habana.pytorch.accelerator import HPUAccelerator
+            from lightning_habana.pytorch.strategies import HPUParallelStrategy, SingleHPUStrategy
+            from lightning_habana.pytorch.plugins import HPUPrecisionPlugin
+            accelerator = HPUAccelerator()
+            devices = n_hpu if n_hpu > 0 else 1
+            trainer_strategy = HPUParallelStrategy() if devices > 1 else SingleHPUStrategy()
+            trainer_plugins = [HPUPrecisionPlugin(precision="bf16-mixed")]
+            logger.info("Using lightning_habana HPUAccelerator and HPU strategy.")
+        except ImportError:
+            accelerator = "hpu"
+            devices = "auto" if n_hpu else 1
+            trainer_strategy = "auto"
+            logger.warning(
+                "lightning_habana is not installed; falling back to Lightning accelerator='hpu', strategy='auto'. "
+                "For single-HPU runs without lightning_habana, MY_PYTHON_CODE=src/train_v1_classic.py is recommended."
+            )
     else:
         accelerator = "cpu"
         devices = 1
+        trainer_strategy = "auto"
     
     # Mixed precision: prefer bf16 when supported (Ampere+), else fp16 (AMP)
     precision = "32-true"
@@ -1053,15 +1090,17 @@ def main(cfg: DictConfig) -> None:
         val_check_interval=eval_every_iter,
         check_val_every_n_epoch=None,
         callbacks=callbacks,
-        # accelerator=accelerator,
-        accelerator="auto",
+        accelerator=accelerator if device_type == "hpu" else "auto",
         devices=devices,
-        precision=precision,
-        strategy="ddp",  # Distributed Data Parallel: all GPUs train one model together (data split, gradients synced)
+        strategy=trainer_strategy,
         enable_progress_bar=True,
         logger=False,  # Disable default Lightning logger
         enable_checkpointing=False,  # Disable default checkpointing, we use our own
     )
+    if trainer_plugins is not None:
+        trainer_kw["plugins"] = trainer_plugins
+    else:
+        trainer_kw["precision"] = precision
     if debug:
         trainer_kw["limit_train_batches"] = 1
         logger.info("Debug: limit_train_batches=1, max_epochs=1; will run 1 batch, then evaluation, then exit.")
