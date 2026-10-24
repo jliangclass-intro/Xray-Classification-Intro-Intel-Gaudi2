@@ -1032,9 +1032,9 @@ def main(cfg: DictConfig) -> None:
         _hpu_count = getattr(torch.hpu, "device_count", None)
         n_hpu = (_hpu_count() if callable(_hpu_count) else _hpu_count) if _hpu_count is not None else 0
         try:
-            from lightning_habana.pytorch.accelerator import HPUAccelerator
-            from lightning_habana.pytorch.strategies import HPUParallelStrategy, SingleHPUStrategy
-            from lightning_habana.pytorch.plugins import HPUPrecisionPlugin
+            from lightning_habana.pytorch.accelerator import HPUAccelerator  # pyrefly: ignore[missing-import]  # Optional Intel Gaudi Lightning plugin
+            from lightning_habana.pytorch.strategies import HPUParallelStrategy, SingleHPUStrategy  # pyrefly: ignore[missing-import]  # Optional Intel Gaudi Lightning plugin
+            from lightning_habana.pytorch.plugins import HPUPrecisionPlugin  # pyrefly: ignore[missing-import]  # Optional Intel Gaudi Lightning plugin
             accelerator = HPUAccelerator()
             devices = n_hpu if n_hpu > 0 else 1
             trainer_strategy = HPUParallelStrategy() if devices > 1 else SingleHPUStrategy()

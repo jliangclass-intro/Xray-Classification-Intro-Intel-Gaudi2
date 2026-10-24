@@ -46,8 +46,8 @@ except Exception as e:
 
 # Test transformers
 try:
-    import transformers
-    from transformers import AutoModel, AutoTokenizer
+    import transformers  # pyrefly: ignore[missing-import]  # Optional environment test dependency
+    from transformers import AutoModel, AutoTokenizer  # pyrefly: ignore[missing-import]  # Optional environment test dependency
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     model = AutoModel.from_pretrained("bert-base-uncased")
     model = model.cuda() if torch.cuda.is_available() else model
