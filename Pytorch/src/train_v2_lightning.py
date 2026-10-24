@@ -1,3 +1,4 @@
+"""PyTorch Lightning training script for multi-label chest X-ray classification."""
 import os
 import socket
 import time
@@ -26,7 +27,14 @@ from evaluate import evaluate, save_predictions, save_val_auroc
 
 # Register custom resolver for formatting learning rate
 def format_lr(lr: float) -> str:
-    """Format learning rate by replacing dots with underscores."""
+    """Format learning rate by replacing dots with underscores for directory naming.
+
+    Args:
+        lr: Learning rate float value (e.g., ``0.0002``).
+
+    Returns:
+        Formatted string with dots replaced by underscores (e.g., ``'0_0002'``).
+    """
     return str(lr).replace(".", "_")
 
 OmegaConf.register_new_resolver("format_lr", format_lr, replace=True)
@@ -42,21 +50,39 @@ if not logger.handlers:
 
 
 def _state_dict_cpu(model: nn.Module) -> dict:
-    """Copy model state dict to CPU. Avoids HPU/Gaudi serialization errors on torch.save."""
+    """Copy a model's ``state_dict`` to CPU tensors before saving.
+
+    Avoids Intel Gaudi 2 (HPU) tensor serialization errors during ``torch.save``.
+
+    Args:
+        model: PyTorch module whose weights are being saved.
+
+    Returns:
+        Dictionary mapping parameter names to cloned CPU tensors.
+    """
     return {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
 
 def _pick_free_port() -> int:
-    """Return a free port for DDP rendezvous to avoid EADDRINUSE when multiple jobs run."""
+    """Find and return an available local TCP port for single-node DDP rendezvous.
+
+    Returns:
+        An unused ephemeral port number on localhost.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
 
 
 class MaskedBCEWithLogitsLoss(nn.Module):
-    """BCEWithLogitsLoss that ignores targets == -1.
-    
-    Students can modify this class to implement custom loss functions.
+    """Binary cross-entropy with logits loss that masks out missing/uncertain labels (``targets == -1``).
+
+    Students can modify this class to implement custom loss functions. Upcasts inputs to
+    ``float32`` internally so ``bfloat16`` sum reduction over ``batch_size * num_classes``
+    does not lose mantissa precision on Intel Gaudi 2 or Ampere+ GPUs.
+
+    Args:
+        pos_weight: Optional per-class positive weight tensor of shape ``(num_classes,)``.
     """
 
     def __init__(self, pos_weight: Optional[torch.Tensor] = None):
@@ -64,6 +90,15 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         self.register_buffer("pos_weight", pos_weight if pos_weight is not None else None)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute masked binary cross-entropy loss over valid (non ``-1``) target entries.
+
+        Args:
+            logits: Raw unnormalized model outputs of shape ``(batch_size, num_classes)``.
+            targets: Ground-truth binary labels in ``{0, 1}`` or ``-1`` (ignored) of shape ``(batch_size, num_classes)``.
+
+        Returns:
+            Scalar mean BCE loss over all valid ``(sample, class)`` pairs in the batch.
+        """
         # Upcast to float32 so bfloat16 sum reduction over (batch_size * num_classes)
         # does not lose mantissa precision on Intel Gaudi 2 (HPU) or Ampere+ GPUs.
         logits = logits.float()
@@ -83,16 +118,25 @@ class MaskedBCEWithLogitsLoss(nn.Module):
 
 
 class AverageMeter:
+    """Running average and current value tracker for loss and timing metrics."""
+
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
+        """Reset all tracked statistics to zero."""
         self.val = 0.0
         self.avg = 0.0
         self.sum = 0.0
         self.count = 0
 
     def update(self, val: float, n: int = 1) -> None:
+        """Record a new observation ``val`` weighted by sample count ``n``.
+
+        Args:
+            val: Observed metric value (e.g., batch mean loss or elapsed seconds).
+            n: Number of items associated with ``val`` (e.g., batch size).
+        """
         self.val = val
         self.sum += val * n
         self.count += n
@@ -100,6 +144,7 @@ class AverageMeter:
 
 
 def seconds_to_hms(seconds: float) -> str:
+    """Format a duration in seconds as ``H:MM:SS``."""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
@@ -107,10 +152,19 @@ def seconds_to_hms(seconds: float) -> str:
 
 
 def should_log(batch_idx: int) -> bool:
+    """Return True if training progress should be logged for ``batch_idx`` (first 20 and every 10th batch)."""
     return batch_idx < 20 or (batch_idx + 1) % 10 == 0
 
 
 def get_lrs(optimizer: optim.Optimizer) -> Tuple[float, float]:
+    """Return ``(lr_head, lr_backbone)`` from the optimizer's parameter groups.
+
+    Args:
+        optimizer: Active PyTorch optimizer.
+
+    Returns:
+        Tuple of ``(first_group_lr, second_group_lr)`` (identical if only one param group exists).
+    """
     if len(optimizer.param_groups) >= 2:
         return optimizer.param_groups[0]["lr"], optimizer.param_groups[1]["lr"]
     lr = optimizer.param_groups[0]["lr"]
@@ -118,6 +172,18 @@ def get_lrs(optimizer: optim.Optimizer) -> Tuple[float, float]:
 
 
 def build_transforms(image_size: int, normalize: str, train: bool = True, crop_strategy: str = "nocrop"):
+    """Build ``torchvision.transforms`` pipeline for training or multi-crop evaluation.
+
+    Args:
+        image_size: Target spatial height and width in pixels (e.g., ``224``).
+        normalize: Normalization preset (``'imagenet'`` or ``'none'``).
+        train: Whether to build the training pipeline (with random horizontal flip and rotation).
+        crop_strategy: Evaluation cropping strategy when ``train=False``:
+            ``'nocrop'`` (direct resize), ``'center_crop'``, or ``'ten_crop'``.
+
+    Returns:
+        Composed ``torchvision.transforms.Compose`` pipeline.
+    """
     t = []
     
     if train:
@@ -151,6 +217,19 @@ def build_transforms(image_size: int, normalize: str, train: bool = True, crop_s
 
 
 def build_model(backbone: str, num_classes: int, pretrained: bool = True) -> nn.Module:
+    """Instantiate a pretrained vision backbone from ``timm`` configured for ``num_classes`` outputs.
+
+    Args:
+        backbone: ``timm`` model identifier (e.g., ``'resnet50'``, ``'convnext_base'``, ``'swin_base_patch4_window7_224'``).
+        num_classes: Number of target classification labels.
+        pretrained: Whether to initialize with pretrained ImageNet weights (required to be True).
+
+    Returns:
+        Instantiated ``torch.nn.Module`` classification model.
+
+    Raises:
+        ValueError: If ``backbone`` is not recognized by ``timm``.
+    """
     backbone = backbone.lower()
     model_name = backbone
 
@@ -163,13 +242,24 @@ def build_model(backbone: str, num_classes: int, pretrained: bool = True) -> nn.
 
 
 def abs_or_none(path: str):
+    """Convert ``path`` to an absolute path via Hydra's ``to_absolute_path``, or return None."""
     if path is None:
         return None
     return to_absolute_path(path)
 
 
 def resolve_data_root(path_or_list) -> Optional[str]:
-    """Resolve a path or list of paths to the first existing directory."""
+    """Resolve a path or list of candidate paths to the first directory that exists on disk.
+
+    Allows dataset YAML configs to list multiple cluster paths (e.g., ``/scratch/...`` and
+    ``/data/jliang12/...``) and automatically select the available one.
+
+    Args:
+        path_or_list: A single path string, a list/ListConfig of candidate path strings, or None.
+
+    Returns:
+        Absolute path string to the first existing directory (or the first candidate as fallback).
+    """
     if path_or_list is None:
         return None
     
@@ -259,14 +349,28 @@ class XRayClassificationModule(L.LightningModule):
         self.data_time_start = None
         
     def configure_loss(self) -> nn.Module:
-        """Configure loss function. Students can override this method to use custom loss."""
+        """Instantiate the training loss function.
+
+        Students can override this method to experiment with custom loss functions.
+
+        Returns:
+            Initialized ``nn.Module`` loss criterion (defaults to ``MaskedBCEWithLogitsLoss``).
+        """
         return MaskedBCEWithLogitsLoss()
     
     def forward(self, x):
         return self.model(x)
     
     def training_step(self, batch, batch_idx):
-        """Training step. Students can override for custom training logic."""
+        """Run a single forward pass and compute the training loss for one mini-batch.
+
+        Args:
+            batch: Tuple of ``(images, labels, resolved_paths, original_paths, original_keys)``.
+            batch_idx: Index of the current batch within the epoch.
+
+        Returns:
+            Scalar loss tensor for backpropagation.
+        """
         # Track data loading time
         if self.data_time_start is not None:
             self.data_time.update(time.time() - self.data_time_start)
@@ -290,18 +394,18 @@ class XRayClassificationModule(L.LightningModule):
         return loss
     
     def on_before_optimizer_step(self, optimizer):
-        """Ensure HPU Lazy Mode flushes the backward graph before optimizer.step()."""
+        """Flush Intel Gaudi 2 (HPU) Lazy Mode backward graph before ``optimizer.step()``."""
         if getattr(self.device, "type", None) == "hpu":
             hpu_mark_step()
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
-        """Run optimizer step and flush HPU Lazy Mode graph afterwards."""
+        """Execute ``optimizer.step()`` and flush Intel Gaudi 2 (HPU) Lazy Mode graph afterwards."""
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure=optimizer_closure)
         if getattr(self.device, "type", None) == "hpu":
             hpu_mark_step()
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Log training progress every 10th batch."""
+        """Log batch timing, learning rate,loss, and ETA every 10th batch (and first 20 batches)."""
         if should_log(batch_idx):
             current_epoch = self.current_epoch + 1
             global_step = self.global_step
@@ -324,22 +428,22 @@ class XRayClassificationModule(L.LightningModule):
             )
     
     def on_train_epoch_start(self):
-        """Reset meters at start of each epoch."""
+        """Reset batch timing and loss meters at the start of each training epoch."""
         self.batch_time.reset()
         self.data_time.reset()
         self.loss_meter.reset()
         self.data_time_start = time.time()
     
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        """Validation step - just pass through, evaluation happens in on_validation_epoch_end."""
+        """No-op per-batch step; full dataset evaluation runs in ``on_validation_epoch_end``."""
         pass
     
     def test_step(self, batch, batch_idx, dataloader_idx=0):
-        """Test step - just pass through, evaluation happens in on_test_epoch_end."""
+        """No-op per-batch step; full dataset evaluation runs in ``on_test_epoch_end``."""
         pass
     
     def on_validation_epoch_end(self):
-        """Evaluate on validation and test sets at end of validation epoch."""
+        """Evaluate the model on all validation and test crop strategies, gather DDP shards, and save CSVs."""
         if self.trainer.sanity_checking:
             return
             
@@ -579,7 +683,7 @@ class XRayClassificationModule(L.LightningModule):
             )
     
     def on_test_epoch_end(self):
-        """Evaluate on test set at end of test epoch."""
+        """Evaluate the best model on all test dataloaders at the end of ``trainer.test()``."""
         test_loaders = getattr(self, "test_loaders", getattr(self, "test_dataloaders", []))
         if not test_loaders:
             test_loader = getattr(self, "test_loader", None)
@@ -674,7 +778,14 @@ class XRayClassificationModule(L.LightningModule):
                 )
     
     def configure_optimizers(self):
-        """Configure optimizer. Students can override this method to use custom optimizer."""
+        """Configure the PyTorch optimizer and optional learning rate scheduler.
+
+        Students can override this method to use custom optimizers or LR schedules.
+
+        Returns:
+            Either a single ``torch.optim.Optimizer``, a ``([optimizer], [scheduler])`` tuple,
+            or a Lightning optimizer/lr_scheduler configuration dictionary.
+        """
         if self.optimizer_name.lower() == "adamw":
             optimizer = optim.AdamW(
                 self.parameters(), 
@@ -759,6 +870,11 @@ class XRayClassificationModule(L.LightningModule):
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
+    """Initialize datasets, LightningModule, callbacks, and Trainer, then run training and testing.
+
+    Args:
+        cfg: Hydra ``DictConfig`` assembled from ``configs/config.yaml`` and CLI overrides.
+    """
     dataset_cfg = cfg.dataset
     model_cfg = cfg.model
     train_cfg = cfg.train

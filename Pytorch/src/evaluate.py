@@ -17,7 +17,14 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_metric_device(device: Union[str, torch.device]) -> Union[str, torch.device]:
-    """Return CPU when device is HPU so torchmetrics int64/sorting/ignore_index ops do not degrade."""
+    """Return CPU when device is HPU so torchmetrics int64/sorting/ignore_index ops do not degrade.
+
+    Args:
+        device: Requested device string or ``torch.device``.
+
+    Returns:
+        ``'cpu'`` if the requested device is an Intel Gaudi HPU, otherwise ``device`` unchanged.
+    """
     dev_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
     if dev_type == "hpu":
         return "cpu"

@@ -1,3 +1,4 @@
+"""CSV-based multi-label chest X-ray dataset loader."""
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -9,6 +10,16 @@ from torch.utils.data import Dataset
 
 
 def make_path(root: Optional[str], p: str, append: str = "") -> str:
+    """Construct a full image file path from an optional root directory and relative path.
+
+    Args:
+        root: Base directory containing the image files (or None if ``p`` is already relative/absolute).
+        p: Relative or absolute image path read from the CSV column.
+        append: Optional suffix (e.g., ``'.jpg'``) to append to ``p`` before resolving.
+
+    Returns:
+        Resolved file path string.
+    """
     if pd.isna(p):
         return p
     s = str(p) + append
@@ -21,19 +32,22 @@ def make_path(root: Optional[str], p: str, append: str = "") -> str:
 
 
 class CSVDataset(Dataset):
-    """
-    Dataset class for CSV-based datasets.
+    """PyTorch Dataset for loading chest X-ray images and multi-label targets from a CSV DataFrame.
+
+    Missing or uncertain labels (NaN or -1 in the CSV) are encoded as ``-1.0`` so that
+    ``MaskedBCEWithLogitsLoss`` and ``torchmetrics`` (``ignore_index=-1``) can mask them out.
 
     Args:
-        df: pandas DataFrame containing the dataset
-        image_key: column name in the DataFrame that contains the image paths
-        label_names: list of column names in the DataFrame that contain the label values
-        image_root: root directory of the images
-        image_append: string to append to the image paths
-        transform: torchvision transform to apply to the images
-        validate_paths: whether to validate the image paths
-        validate_samples: number of samples to validate the image paths
+        df: pandas DataFrame containing image paths and label columns.
+        image_key: Column name in ``df`` containing the image file paths.
+        label_names: List of column names in ``df`` corresponding to the target disease labels.
+        image_root: Root directory prepended to relative paths in ``image_key``.
+        image_append: Optional file extension/suffix appended to each path in ``image_key``.
+        transform: Optional ``torchvision.transforms`` pipeline applied to each PIL image.
+        validate_paths: Whether to check that a random subset of image files exists on disk at init.
+        validate_samples: Number of random rows to check when ``validate_paths=True``.
     """
+
     def __init__(
         self,
         df: pd.DataFrame,
@@ -69,6 +83,14 @@ class CSVDataset(Dataset):
             self._validate_paths(validate_samples)
 
     def _validate_paths(self, n_samples: int = 5) -> None:
+        """Verify that a random sample of resolved image paths exists on disk.
+
+        Args:
+            n_samples: Number of random rows from the DataFrame to check.
+
+        Raises:
+            FileNotFoundError: If any sampled image path is NaN or does not exist on disk.
+        """
         n_samples = min(n_samples, len(self.df))
         indices = np.random.choice(len(self.df), n_samples, replace=False)
         missing = []
@@ -83,6 +105,14 @@ class CSVDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str, str, Optional[str]]:
+        """Load and transform a single image and its multi-label target vector.
+
+        Args:
+            idx: Sample index in ``[0, len(self) - 1]``.
+
+        Returns:
+            Tuple of ``(image_tensor, labels_tensor, resolved_path, original_path, original_key)``.
+        """
         row = self.df.iloc[idx]
         image_path = row[self.image_key]
         if pd.isna(image_path):
