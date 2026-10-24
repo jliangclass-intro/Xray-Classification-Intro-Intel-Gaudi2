@@ -3,9 +3,9 @@ outputs/
 output-*
 plots/
 *nogit*
+*local*
 *.out
 *.err
-*.local.*
 .agent/
 .ruff_cache/
 *.code-workspace
